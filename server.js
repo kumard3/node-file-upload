@@ -8,30 +8,26 @@ const path = require("path");
 const cors = require("cors");
 const sqlite3 = require("sqlite3").verbose();
 const { open } = require("sqlite");
-const EventEmitter = require("events");
 
 if (cluster.isMaster) {
   console.log(`Master ${process.pid} is running`);
 
-  // Fork workers.
   for (let i = 0; i < numCPUs; i++) {
     cluster.fork();
   }
 
   cluster.on("exit", (worker, code, signal) => {
     console.log(`worker ${worker.process.pid} died`);
-    // Replace the dead worker
     cluster.fork();
   });
 } else {
-  // Workers can share any TCP connection
-  // In this case it is an HTTP server
   const app = express();
   const upload = multer({ dest: "temp_chunks/" });
-
+  app.use(express.static("./public"));
   app.use(cors());
   app.use(express.json());
-  app.use(express.static("uploads")); // Serve uploaded files
+  app.use(express.static("uploads"));
+  app.use(express.static("public"));
 
   let db;
 
@@ -42,76 +38,39 @@ if (cluster.isMaster) {
     });
 
     await db.exec(`
-      CREATE TABLE IF NOT EXISTS chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        fileId TEXT,
-        originalname TEXT,
-        chunkIndex INTEGER,
-        totalChunks INTEGER,
-        filename TEXT,
-        metadata TEXT
-      );
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fileId TEXT,
+                originalname TEXT,
+                chunkIndex INTEGER,
+                totalChunks INTEGER,
+                filename TEXT,
+                metadata TEXT
+            );
 
-      CREATE TABLE IF NOT EXISTS files (
-        id TEXT PRIMARY KEY,
-        originalname TEXT,
-        fileSize INTEGER,
-        fileType TEXT,
-        uploadedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                originalname TEXT,
+                fileSize INTEGER,
+                fileType TEXT,
+                uploadedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
   })();
 
-  const uploadProgress = new EventEmitter();
-
-  app.get("/upload-progress", (req, res) => {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    });
-
-    const sendProgress = (data) => {
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
-    };
-
-    uploadProgress.on("progress", sendProgress);
-
-    req.on("close", () => {
-      uploadProgress.removeListener("progress", sendProgress);
-    });
-  });
-
   app.post("/upload", upload.single("chunk"), async (req, res) => {
-    console.log("Received upload request");
-    console.log("Request body:", req.body);
-    console.log("Request file:", req.file);
-
     if (!req.file) {
       return res.status(400).json({ message: "No file uploaded" });
     }
 
+    const { fileId, fileName, chunkIndex, totalChunks } = req.body;
     const { originalname, filename } = req.file;
-    const { fileId, chunkMetadata, totalChunks, fileSize, fileType } = req.body;
-    const parsedChunkMetadata = JSON.parse(chunkMetadata);
-    const { chunkIndex } = parsedChunkMetadata;
-
-    console.log(
-      `Processing chunk ${chunkIndex} of ${totalChunks} for file: ${originalname} (FileID: ${fileId})`
-    );
 
     try {
       await db.run(
-        `INSERT INTO chunks (fileId, originalname, chunkIndex, totalChunks, filename, metadata)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          fileId,
-          originalname,
-          chunkIndex,
-          totalChunks,
-          filename,
-          JSON.stringify({ fileSize, fileType, ...parsedChunkMetadata }),
-        ]
+        `INSERT INTO chunks (fileId, originalname, chunkIndex, totalChunks, filename)
+                 VALUES (?, ?, ?, ?, ?)`,
+        [fileId, fileName, chunkIndex, totalChunks, filename]
       );
 
       const [{ count }] = await db.all(
@@ -119,30 +78,21 @@ if (cluster.isMaster) {
         [fileId, totalChunks]
       );
 
-      uploadProgress.emit("progress", {
-        fileId,
-        filename: originalname,
-        progress: Math.round((count / totalChunks) * 100),
-      });
-
       if (parseInt(count) === parseInt(totalChunks)) {
-        console.log(`All chunks received for ${originalname}. Combining file.`);
         const outputPath = path.join(
           __dirname,
           "uploads",
-          `${fileId}_${originalname}`
+          `${fileId}_${fileName}`
         );
 
         await combineChunks(fileId, outputPath);
-        console.log(`File combined and saved to: ${outputPath}`);
 
-        // Save file metadata to the database
+        const fileStats = await fsPromises.stat(outputPath);
         await db.run(
           `INSERT INTO files (id, originalname, fileSize, fileType) VALUES (?, ?, ?, ?)`,
-          [fileId, originalname, fileSize, fileType]
+          [fileId, fileName, fileStats.size, req.file.mimetype]
         );
 
-        // Delete all chunk files and database entries
         await deleteChunks(fileId);
 
         res.json({
@@ -150,21 +100,19 @@ if (cluster.isMaster) {
           fileId: fileId,
         });
       } else {
-        console.log(`Chunk ${chunkIndex} received for ${originalname}`);
         res.json({ message: "Chunk received" });
       }
     } catch (error) {
       console.error("Error processing chunk:", error);
       res.status(500).json({ message: "Error processing chunk" });
     }
-    // Remove the finally block that was here
   });
 
   async function combineChunks(fileId, outputPath) {
     const writeStream = fs.createWriteStream(outputPath);
 
     const chunks = await db.all(
-      `SELECT filename, metadata FROM chunks WHERE fileId = ? ORDER BY chunkIndex`,
+      `SELECT filename FROM chunks WHERE fileId = ? ORDER BY chunkIndex`,
       [fileId]
     );
 
@@ -198,7 +146,6 @@ if (cluster.isMaster) {
       const chunkPath = path.join(__dirname, "temp_chunks", chunk.filename);
       try {
         await fsPromises.unlink(chunkPath);
-        console.log(`Removed chunk file: ${chunkPath}`);
       } catch (error) {
         if (error.code !== "ENOENT") {
           console.error(`Error deleting chunk file ${chunkPath}:`, error);
@@ -207,7 +154,6 @@ if (cluster.isMaster) {
     }
 
     await db.run(`DELETE FROM chunks WHERE fileId = ?`, [fileId]);
-    console.log(`Cleared chunk data for fileId: ${fileId}`);
   }
 
   app.get("/files", async (req, res) => {
@@ -223,7 +169,7 @@ if (cluster.isMaster) {
   });
 
   app.get("/", (req, res) => {
-    res.sendFile(path.join(__dirname, "index.html"));
+    res.sendFile(path.join(__dirname, "public", "index.html"));
   });
 
   const PORT = 3000;

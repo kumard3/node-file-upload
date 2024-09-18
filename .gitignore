@@ -2,4 +2,5 @@
 /uploads
 /temp_chunks
 
-*/chunks.dbchunks.db
+*/chunks.db
+chunks.db

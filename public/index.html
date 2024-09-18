@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Advanced File Uploader</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .flex {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+      button {
+        padding: 10px;
+        font-size: 16px;
+        cursor: pointer;
+      }
+      .error {
+        color: red;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        border: 1px solid #ddd;
+        padding: 8px;
+        text-align: left;
+      }
+      th {
+        background-color: #f2f2f2;
+      }
+      .file-item {
+        margin-bottom: 10px;
+        padding: 10px;
+        border: 1px solid #ddd;
+        display: flex;
+        align-items: center;
+      }
+      .file-preview {
+        width: 50px;
+        height: 50px;
+        margin-right: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #f0f0f0;
+        font-size: 24px;
+      }
+      .file-preview img {
+        max-width: 100%;
+        max-height: 100%;
+        object-fit: cover;
+      }
+      .progress-bar {
+        height: 20px;
+        background-color: #f0f0f0;
+        margin-top: 5px;
+        flex-grow: 1;
+      }
+      .progress-bar-fill {
+        height: 100%;
+        background-color: #4caf50;
+        width: 0%;
+        transition: width 0.3s ease-in-out;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="flex">
+      <h1>Advanced File Uploader</h1>
+      <input type="file" id="fileInput" multiple />
+      <button id="uploadButton">Upload</button>
+      <div id="fileList"></div>
+      <h2>Uploaded Files</h2>
+      <table id="filesTable">
+        <thead>
+          <tr>
+            <th>Preview</th>
+            <th>File Name</th>
+            <th>Size</th>
+            <th>Type</th>
+            <th>Uploaded At</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <script>
+      const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+      const MAX_PARALLEL_CHUNKS = 5;
+      const MAX_RETRY_ATTEMPTS = 3;
+
+      let db;
+      const dbName = "FileUploaderDB";
+      const storeName = "files";
+
+      // Initialize IndexedDB
+      const request = indexedDB.open(dbName, 1);
+      request.onerror = (event) =>
+        console.error("IndexedDB error:", event.target.error);
+      request.onsuccess = (event) => {
+        db = event.target.result;
+        displayPendingUploads();
+      };
+      request.onupgradeneeded = (event) => {
+        db = event.target.result;
+        db.createObjectStore(storeName, { keyPath: "id" });
+      };
+
+      // Register Service Worker
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker
+          .register("service-worker.js")
+          .then((reg) => console.log("Service Worker registered"))
+          .catch((err) =>
+            console.log("Service Worker registration failed:", err)
+          );
+      }
+
+      const fileInput = document.getElementById("fileInput");
+      const uploadButton = document.getElementById("uploadButton");
+      const fileList = document.getElementById("fileList");
+      const filesTable = document
+        .getElementById("filesTable")
+        .getElementsByTagName("tbody")[0];
+
+      fileInput.addEventListener("change", handleFileSelect);
+      uploadButton.addEventListener("click", startUploads);
+      function displayFileItem(fileItem) {
+        const fileDiv = document.createElement("div");
+        fileDiv.id = `file-${fileItem.id}`;
+        fileDiv.className = "file-item";
+
+        const previewDiv = document.createElement("div");
+        previewDiv.className = "file-preview";
+
+        if (fileItem.file.type.startsWith("image/")) {
+          const img = document.createElement("img");
+          img.src = URL.createObjectURL(fileItem.file);
+          previewDiv.appendChild(img);
+        } else {
+          const icon = document.createElement("i");
+          icon.className = getFileIcon(fileItem.file.type);
+          previewDiv.appendChild(icon);
+        }
+
+        const infoDiv = document.createElement("div");
+        infoDiv.innerHTML = `
+                <div>${fileItem.file.name}</div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill" id="progress-${fileItem.id}"></div>
+                </div>
+            `;
+
+        fileDiv.appendChild(previewDiv);
+        fileDiv.appendChild(infoDiv);
+        fileList.appendChild(fileDiv);
+      }
+
+      function getFileIcon(mimeType) {
+        switch (true) {
+          case mimeType.startsWith("image/"):
+            return "fas fa-image";
+          case mimeType.startsWith("video/"):
+            return "fas fa-video";
+          case mimeType.startsWith("audio/"):
+            return "fas fa-music";
+          case mimeType.includes("pdf"):
+            return "fas fa-file-pdf";
+          case mimeType.includes("word"):
+            return "fas fa-file-word";
+          case mimeType.includes("excel") || mimeType.includes("spreadsheet"):
+            return "fas fa-file-excel";
+          case mimeType.includes("powerpoint") ||
+            mimeType.includes("presentation"):
+            return "fas fa-file-powerpoint";
+          default:
+            return "fas fa-file";
+        }
+      }
+
+      function updateFilesTable(files) {
+        filesTable.innerHTML = "";
+        files.forEach((file) => {
+          const row = filesTable.insertRow();
+
+          const previewCell = row.insertCell(0);
+          const previewDiv = document.createElement("div");
+          previewDiv.className = "file-preview";
+          if (file.fileType.startsWith("image/")) {
+            const img = document.createElement("img");
+            img.src = `/${file.id}_${file.originalname}`;
+            previewDiv.appendChild(img);
+          } else {
+            const icon = document.createElement("i");
+            icon.className = getFileIcon(file.fileType);
+            previewDiv.appendChild(icon);
+          }
+          previewCell.appendChild(previewDiv);
+
+          row.insertCell(1).textContent = file.originalname;
+          row.insertCell(2).textContent = formatFileSize(file.fileSize);
+          row.insertCell(3).textContent = file.fileType;
+          row.insertCell(4).textContent = new Date(
+            file.uploadedAt
+          ).toLocaleString();
+          const actionCell = row.insertCell(5);
+          const downloadLink = document.createElement("a");
+          downloadLink.href = `/${file.id}_${file.originalname}`;
+          downloadLink.textContent = "Download";
+          downloadLink.download = file.originalname;
+          actionCell.appendChild(downloadLink);
+        });
+      }
+      function handleFileSelect(event) {
+        const files = Array.from(event.target.files);
+        files.forEach((file) => {
+          const fileId = Date.now() + "-" + file.name;
+          const fileItem = {
+            id: fileId,
+            file: file,
+            progress: 0,
+            status: "pending",
+          };
+          saveFileToIndexedDB(fileItem);
+          displayFileItem(fileItem);
+        });
+      }
+
+      function saveFileToIndexedDB(fileItem) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        store.put(fileItem);
+      }
+
+      function displayFileItem(fileItem) {
+        const fileDiv = document.createElement("div");
+        fileDiv.id = `file-${fileItem.id}`;
+        fileDiv.className = "file-item";
+        fileDiv.innerHTML = `
+                <div>${fileItem.file.name}</div>
+                <div class="progress-bar">
+                    <div class="progress-bar-fill" id="progress-${fileItem.id}"></div>
+                </div>
+            `;
+        fileList.appendChild(fileDiv);
+      }
+
+      function startUploads() {
+        const transaction = db.transaction([storeName], "readonly");
+        const store = transaction.objectStore(storeName);
+        const request = store.getAll();
+        request.onsuccess = (event) => {
+          const files = event.target.result;
+          files.forEach((fileItem) => {
+            if (fileItem.status === "pending") {
+              uploadFile(fileItem);
+            }
+          });
+        };
+      }
+
+      async function uploadFile(fileItem) {
+        const file = fileItem.file;
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const chunkPromises = [];
+
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+          const start = chunkIndex * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = file.slice(start, end);
+          chunkPromises.push(
+            uploadChunk(fileItem, chunk, chunkIndex, totalChunks)
+          );
+
+          if (chunkPromises.length >= MAX_PARALLEL_CHUNKS) {
+            await Promise.all(chunkPromises);
+            chunkPromises.length = 0;
+          }
+        }
+
+        await Promise.all(chunkPromises);
+        markFileAsCompleted(fileItem.id);
+      }
+
+      async function uploadChunk(
+        fileItem,
+        chunk,
+        chunkIndex,
+        totalChunks,
+        retryCount = 0
+      ) {
+        const formData = new FormData();
+        formData.append("fileId", fileItem.id);
+        formData.append("fileName", fileItem.file.name);
+        formData.append("chunkIndex", chunkIndex);
+        formData.append("totalChunks", totalChunks);
+        formData.append("chunk", chunk);
+
+        try {
+          const response = await fetch("/upload", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+
+          const progress = ((chunkIndex + 1) / totalChunks) * 100;
+          updateProgress(fileItem.id, progress);
+          saveProgress(fileItem.id, progress);
+        } catch (error) {
+          console.error("Upload error:", error);
+          if (retryCount < MAX_RETRY_ATTEMPTS) {
+            console.log(
+              `Retrying chunk ${chunkIndex} (Attempt ${retryCount + 1})`
+            );
+            await new Promise((resolve) =>
+              setTimeout(resolve, 1000 * (retryCount + 1))
+            );
+            return uploadChunk(
+              fileItem,
+              chunk,
+              chunkIndex,
+              totalChunks,
+              retryCount + 1
+            );
+          } else {
+            throw new Error(
+              `Failed to upload chunk ${chunkIndex} after ${MAX_RETRY_ATTEMPTS} attempts`
+            );
+          }
+        }
+      }
+
+      function updateProgress(fileId, progress) {
+        const progressBar = document.getElementById(`progress-${fileId}`);
+        if (progressBar) {
+          progressBar.style.width = `${progress}%`;
+        }
+      }
+
+      function saveProgress(fileId, progress) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.get(fileId);
+        request.onsuccess = (event) => {
+          const fileItem = event.target.result;
+          fileItem.progress = progress;
+          store.put(fileItem);
+        };
+      }
+
+      function markFileAsCompleted(fileId) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.get(fileId);
+        request.onsuccess = (event) => {
+          const fileItem = event.target.result;
+          fileItem.status = "completed";
+          store.put(fileItem);
+          const fileDiv = document.getElementById(`file-${fileId}`);
+          if (fileDiv) {
+            fileDiv.remove();
+          }
+          fetchUploadedFiles();
+        };
+      }
+
+      function displayPendingUploads() {
+        const transaction = db.transaction([storeName], "readonly");
+        const store = transaction.objectStore(storeName);
+        const request = store.getAll();
+        request.onsuccess = (event) => {
+          const files = event.target.result;
+          files.forEach((fileItem) => {
+            if (fileItem.status === "pending") {
+              displayFileItem(fileItem);
+              updateProgress(fileItem.id, fileItem.progress);
+            }
+          });
+        };
+      }
+
+      function fetchUploadedFiles() {
+        fetch("/files")
+          .then((response) => response.json())
+          .then((files) => {
+            updateFilesTable(files);
+          })
+          .catch((error) => console.error("Error fetching files:", error));
+      }
+
+      // function updateFilesTable(files) {
+      //   filesTable.innerHTML = "";
+      //   files.forEach((file) => {
+      //     const row = filesTable.insertRow();
+      //     row.insertCell(0).textContent = file.originalname;
+      //     row.insertCell(1).textContent = formatFileSize(file.fileSize);
+      //     row.insertCell(2).textContent = file.fileType;
+      //     row.insertCell(3).textContent = new Date(
+      //       file.uploadedAt
+      //     ).toLocaleString();
+      //     const actionCell = row.insertCell(4);
+      //     const downloadLink = document.createElement("a");
+      //     downloadLink.href = `/${file.id}_${file.originalname}`;
+      //     downloadLink.textContent = "Download";
+      //     downloadLink.download = file.originalname;
+      //     actionCell.appendChild(downloadLink);
+      //   });
+      // }
+
+      function formatFileSize(bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1048576) return (bytes / 1024).toFixed(2) + " KB";
+        if (bytes < 1073741824) return (bytes / 1048576).toFixed(2) + " MB";
+        return (bytes / 1073741824).toFixed(2) + " GB";
+      }
+
+      // Fetch files on page load
+      fetchUploadedFiles();
+    </script>
+  </body>
+</html>
