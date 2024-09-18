@@ -1,3 +1,5 @@
 /node_modules
 /uploads
 /temp_chunks
+
+*/chunks.dbchunks.db
