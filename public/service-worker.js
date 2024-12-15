@@ -1,11 +1,35 @@
 const CACHE_NAME = "my-site-cache-v1";
+const urlsToCache = [
+  "/",
+  "/index.html",
+  "/service-worker.js",
+  // Add other static assets you want to cache
+];
 
 self.addEventListener("install", (event) => {
-  console.log("Service Worker installed");
+  console.log('Service Worker installing.');
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => {
+      console.log("Opened cache");
+      return cache.addAll(urlsToCache);
+    })
+  );
 });
 
 self.addEventListener("activate", (event) => {
-  console.log("Service Worker activated");
+  console.log('Service Worker activating.');
+  const cacheWhitelist = [CACHE_NAME];
+  event.waitUntil(
+    caches.keys().then((cacheNames) => {
+      return Promise.all(
+        cacheNames.map((cacheName) => {
+          if (cacheWhitelist.indexOf(cacheName) === -1) {
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+  );
 });
 
 self.addEventListener("fetch", (event) => {
@@ -14,21 +38,19 @@ self.addEventListener("fetch", (event) => {
       if (response) {
         return response;
       }
-      return fetch(event.request).then((networkResponse) => {
-        if (
-          !networkResponse ||
-          networkResponse.status !== 200 ||
-          networkResponse.type !== "basic"
-        ) {
-          return networkResponse;
+      const fetchRequest = event.request.clone();
+
+      return fetch(fetchRequest).then((response) => {
+        if (!response || response.status !== 200 || response.type !== 'basic') {
+          return response;
         }
-        const responseToCache = networkResponse.clone();
+        const responseToCache = response.clone();
 
         caches.open(CACHE_NAME).then((cache) => {
           cache.put(event.request, responseToCache);
         });
 
-        return networkResponse;
+        return response;
       });
     })
   );

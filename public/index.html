@@ -95,9 +95,8 @@
       </table>
     </div>
     <script>
-      const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
-      const MAX_PARALLEL_CHUNKS = 5;
-      const MAX_RETRY_ATTEMPTS = 3;
+      const CHUNK_SIZE = 500 * 1024; // 500KB chunks
+      const serverUrl = "http://localhost:3000"; // Update with your server URL
 
       let db;
       const dbName = "FileUploaderDB";
@@ -116,16 +115,6 @@
         db.createObjectStore(storeName, { keyPath: "id" });
       };
 
-      // Register Service Worker
-      if ("serviceWorker" in navigator) {
-        navigator.serviceWorker
-          .register("service-worker.js")
-          .then((reg) => console.log("Service Worker registered"))
-          .catch((err) =>
-            console.log("Service Worker registration failed:", err)
-          );
-      }
-
       const fileInput = document.getElementById("fileInput");
       const uploadButton = document.getElementById("uploadButton");
       const fileList = document.getElementById("fileList");
@@ -135,57 +124,146 @@
 
       fileInput.addEventListener("change", handleFileSelect);
       uploadButton.addEventListener("click", startUploads);
+
+      function handleFileSelect(event) {
+        const files = Array.from(event.target.files);
+        files.forEach((file) => {
+          const fileId = Date.now() + "-" + file.name;
+          const fileItem = {
+            id: fileId,
+            file: file,
+            progress: 0,
+            status: "pending",
+          };
+          saveFileToIndexedDB(fileItem);
+          displayFileItem(fileItem);
+        });
+      }
+
+      function saveFileToIndexedDB(fileItem) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        store.put(fileItem);
+      }
+
       function displayFileItem(fileItem) {
         const fileDiv = document.createElement("div");
         fileDiv.id = `file-${fileItem.id}`;
         fileDiv.className = "file-item";
-
-        const previewDiv = document.createElement("div");
-        previewDiv.className = "file-preview";
-
-        if (fileItem.file.type.startsWith("image/")) {
-          const img = document.createElement("img");
-          img.src = URL.createObjectURL(fileItem.file);
-          previewDiv.appendChild(img);
-        } else {
-          const icon = document.createElement("i");
-          icon.className = getFileIcon(fileItem.file.type);
-          previewDiv.appendChild(icon);
-        }
-
-        const infoDiv = document.createElement("div");
-        infoDiv.innerHTML = `
-                <div>${fileItem.file.name}</div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill" id="progress-${fileItem.id}"></div>
-                </div>
-            `;
-
-        fileDiv.appendChild(previewDiv);
-        fileDiv.appendChild(infoDiv);
+        fileDiv.innerHTML = `
+          <div>${fileItem.file.name}</div>
+          <div class="progress-bar">
+            <div class="progress-bar-fill" id="progress-${fileItem.id}"></div>
+          </div>
+        `;
         fileList.appendChild(fileDiv);
       }
 
-      function getFileIcon(mimeType) {
-        switch (true) {
-          case mimeType.startsWith("image/"):
-            return "fas fa-image";
-          case mimeType.startsWith("video/"):
-            return "fas fa-video";
-          case mimeType.startsWith("audio/"):
-            return "fas fa-music";
-          case mimeType.includes("pdf"):
-            return "fas fa-file-pdf";
-          case mimeType.includes("word"):
-            return "fas fa-file-word";
-          case mimeType.includes("excel") || mimeType.includes("spreadsheet"):
-            return "fas fa-file-excel";
-          case mimeType.includes("powerpoint") ||
-            mimeType.includes("presentation"):
-            return "fas fa-file-powerpoint";
-          default:
-            return "fas fa-file";
+      function startUploads() {
+        const transaction = db.transaction([storeName], "readonly");
+        const store = transaction.objectStore(storeName);
+        const request = store.getAll();
+        request.onsuccess = (event) => {
+          const files = event.target.result;
+          files.forEach((fileItem) => {
+            if (fileItem.status === "pending") {
+              uploadFile(fileItem);
+            }
+          });
+        };
+      }
+
+      async function uploadFile(fileItem) {
+        const file = fileItem.file;
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const worker = new Worker("uploadWorker.js");
+
+        worker.onmessage = (event) => {
+          const { success, chunkIndex, error } = event.data;
+          if (success) {
+            const progress = ((chunkIndex + 1) / totalChunks) * 100;
+            updateProgress(fileItem.id, progress);
+            saveProgress(fileItem.id, progress);
+            if (progress === 100) {
+              markFileAsCompleted(fileItem.id);
+            }
+          } else {
+            console.error(`Error uploading chunk ${chunkIndex}: ${error}`);
+          }
+        };
+
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+          const start = chunkIndex * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = file.slice(start, end);
+
+          worker.postMessage({
+            fileId: fileItem.id,
+            fileName: fileItem.file.name,
+            chunk,
+            chunkIndex,
+            totalChunks,
+            serverUrl,
+          });
         }
+      }
+
+      function updateProgress(fileId, progress) {
+        const progressBar = document.getElementById(`progress-${fileId}`);
+        if (progressBar) {
+          progressBar.style.width = `${progress}%`;
+        }
+      }
+
+      function saveProgress(fileId, progress) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.get(fileId);
+        request.onsuccess = (event) => {
+          const fileItem = event.target.result;
+          fileItem.progress = progress;
+          store.put(fileItem);
+        };
+      }
+
+      function markFileAsCompleted(fileId) {
+        const transaction = db.transaction([storeName], "readwrite");
+        const store = transaction.objectStore(storeName);
+        const request = store.get(fileId);
+        request.onsuccess = (event) => {
+          const fileItem = event.target.result;
+          fileItem.status = "completed";
+          store.delete(fileId); // Delete the file entry from IndexedDB
+          const fileDiv = document.getElementById(`file-${fileId}`);
+          if (fileDiv) {
+            fileDiv.remove();
+          }
+          fetchUploadedFiles();
+        };
+      }
+
+      function displayPendingUploads() {
+        const transaction = db.transaction([storeName], "readonly");
+        const store = transaction.objectStore(storeName);
+        const request = store.getAll();
+        request.onsuccess = (event) => {
+          const files = event.target.result;
+          files.forEach((fileItem) => {
+            if (fileItem.status === "pending") {
+              displayFileItem(fileItem);
+              updateProgress(fileItem.id, fileItem.progress);
+            }
+          });
+        };
+      }
+
+      function fetchUploadedFiles() {
+        fetch("/files")
+          .then((response) => response.json())
+          .then((files) => {
+            updateFilesTable(files);
+          })
+          .catch((error) => console.error("Error fetching files:", error));
       }
 
       function updateFilesTable(files) {
@@ -221,204 +299,28 @@
           actionCell.appendChild(downloadLink);
         });
       }
-      function handleFileSelect(event) {
-        const files = Array.from(event.target.files);
-        files.forEach((file) => {
-          const fileId = Date.now() + "-" + file.name;
-          const fileItem = {
-            id: fileId,
-            file: file,
-            progress: 0,
-            status: "pending",
-          };
-          saveFileToIndexedDB(fileItem);
-          displayFileItem(fileItem);
-        });
-      }
 
-      function saveFileToIndexedDB(fileItem) {
-        const transaction = db.transaction([storeName], "readwrite");
-        const store = transaction.objectStore(storeName);
-        store.put(fileItem);
-      }
-
-      function displayFileItem(fileItem) {
-        const fileDiv = document.createElement("div");
-        fileDiv.id = `file-${fileItem.id}`;
-        fileDiv.className = "file-item";
-        fileDiv.innerHTML = `
-                <div>${fileItem.file.name}</div>
-                <div class="progress-bar">
-                    <div class="progress-bar-fill" id="progress-${fileItem.id}"></div>
-                </div>
-            `;
-        fileList.appendChild(fileDiv);
-      }
-
-      function startUploads() {
-        const transaction = db.transaction([storeName], "readonly");
-        const store = transaction.objectStore(storeName);
-        const request = store.getAll();
-        request.onsuccess = (event) => {
-          const files = event.target.result;
-          files.forEach((fileItem) => {
-            if (fileItem.status === "pending") {
-              uploadFile(fileItem);
-            }
-          });
-        };
-      }
-
-      async function uploadFile(fileItem) {
-        const file = fileItem.file;
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-        const chunkPromises = [];
-
-        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-          const start = chunkIndex * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, file.size);
-          const chunk = file.slice(start, end);
-          chunkPromises.push(
-            uploadChunk(fileItem, chunk, chunkIndex, totalChunks)
-          );
-
-          if (chunkPromises.length >= MAX_PARALLEL_CHUNKS) {
-            await Promise.all(chunkPromises);
-            chunkPromises.length = 0;
-          }
-        }
-
-        await Promise.all(chunkPromises);
-        markFileAsCompleted(fileItem.id);
-      }
-
-      async function uploadChunk(
-        fileItem,
-        chunk,
-        chunkIndex,
-        totalChunks,
-        retryCount = 0
-      ) {
-        const formData = new FormData();
-        formData.append("fileId", fileItem.id);
-        formData.append("fileName", fileItem.file.name);
-        formData.append("chunkIndex", chunkIndex);
-        formData.append("totalChunks", totalChunks);
-        formData.append("chunk", chunk);
-
-        try {
-          const response = await fetch("/upload", {
-            method: "POST",
-            body: formData,
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-
-          const progress = ((chunkIndex + 1) / totalChunks) * 100;
-          updateProgress(fileItem.id, progress);
-          saveProgress(fileItem.id, progress);
-        } catch (error) {
-          console.error("Upload error:", error);
-          if (retryCount < MAX_RETRY_ATTEMPTS) {
-            console.log(
-              `Retrying chunk ${chunkIndex} (Attempt ${retryCount + 1})`
-            );
-            await new Promise((resolve) =>
-              setTimeout(resolve, 1000 * (retryCount + 1))
-            );
-            return uploadChunk(
-              fileItem,
-              chunk,
-              chunkIndex,
-              totalChunks,
-              retryCount + 1
-            );
-          } else {
-            throw new Error(
-              `Failed to upload chunk ${chunkIndex} after ${MAX_RETRY_ATTEMPTS} attempts`
-            );
-          }
+      function getFileIcon(mimeType) {
+        switch (true) {
+          case mimeType.startsWith("image/"):
+            return "fas fa-image";
+          case mimeType.startsWith("video/"):
+            return "fas fa-video";
+          case mimeType.startsWith("audio/"):
+            return "fas fa-music";
+          case mimeType.includes("pdf"):
+            return "fas fa-file-pdf";
+          case mimeType.includes("word"):
+            return "fas fa-file-word";
+          case mimeType.includes("excel") || mimeType.includes("spreadsheet"):
+            return "fas fa-file-excel";
+          case mimeType.includes("powerpoint") ||
+            mimeType.includes("presentation"):
+            return "fas fa-file-powerpoint";
+          default:
+            return "fas fa-file";
         }
       }
-
-      function updateProgress(fileId, progress) {
-        const progressBar = document.getElementById(`progress-${fileId}`);
-        if (progressBar) {
-          progressBar.style.width = `${progress}%`;
-        }
-      }
-
-      function saveProgress(fileId, progress) {
-        const transaction = db.transaction([storeName], "readwrite");
-        const store = transaction.objectStore(storeName);
-        const request = store.get(fileId);
-        request.onsuccess = (event) => {
-          const fileItem = event.target.result;
-          fileItem.progress = progress;
-          store.put(fileItem);
-        };
-      }
-
-      function markFileAsCompleted(fileId) {
-        const transaction = db.transaction([storeName], "readwrite");
-        const store = transaction.objectStore(storeName);
-        const request = store.get(fileId);
-        request.onsuccess = (event) => {
-          const fileItem = event.target.result;
-          fileItem.status = "completed";
-          store.put(fileItem);
-          const fileDiv = document.getElementById(`file-${fileId}`);
-          if (fileDiv) {
-            fileDiv.remove();
-          }
-          fetchUploadedFiles();
-        };
-      }
-
-      function displayPendingUploads() {
-        const transaction = db.transaction([storeName], "readonly");
-        const store = transaction.objectStore(storeName);
-        const request = store.getAll();
-        request.onsuccess = (event) => {
-          const files = event.target.result;
-          files.forEach((fileItem) => {
-            if (fileItem.status === "pending") {
-              displayFileItem(fileItem);
-              updateProgress(fileItem.id, fileItem.progress);
-            }
-          });
-        };
-      }
-
-      function fetchUploadedFiles() {
-        fetch("/files")
-          .then((response) => response.json())
-          .then((files) => {
-            updateFilesTable(files);
-          })
-          .catch((error) => console.error("Error fetching files:", error));
-      }
-
-      // function updateFilesTable(files) {
-      //   filesTable.innerHTML = "";
-      //   files.forEach((file) => {
-      //     const row = filesTable.insertRow();
-      //     row.insertCell(0).textContent = file.originalname;
-      //     row.insertCell(1).textContent = formatFileSize(file.fileSize);
-      //     row.insertCell(2).textContent = file.fileType;
-      //     row.insertCell(3).textContent = new Date(
-      //       file.uploadedAt
-      //     ).toLocaleString();
-      //     const actionCell = row.insertCell(4);
-      //     const downloadLink = document.createElement("a");
-      //     downloadLink.href = `/${file.id}_${file.originalname}`;
-      //     downloadLink.textContent = "Download";
-      //     downloadLink.download = file.originalname;
-      //     actionCell.appendChild(downloadLink);
-      //   });
-      // }
 
       function formatFileSize(bytes) {
         if (bytes < 1024) return bytes + " B";

@@ -1,179 +1,324 @@
-const cluster = require("cluster");
-const numCPUs = require("os").cpus().length;
-const express = require("express");
-const multer = require("multer");
-const fs = require("fs");
-const fsPromises = require("fs").promises;
-const path = require("path");
-const cors = require("cors");
-const sqlite3 = require("sqlite3").verbose();
-const { open } = require("sqlite");
+import { Hono } from "hono";
+import { serveStatic } from "@hono/node-server/serve-static";
+import { Database } from "bun:sqlite";
+import { writeFile, unlink, stat, mkdir, rmdir } from "fs/promises";
+import { createReadStream, createWriteStream } from "fs";
+import * as path from "path";
+import { Worker } from "worker_threads";
+import { cpus } from "os";
+import { EventEmitter } from "events";
+import { WebSocketServer } from "ws";
+import { v4 as uuidv4 } from 'uuid';
 
-if (cluster.isMaster) {
-  console.log(`Master ${process.pid} is running`);
+const app = new Hono();
+const PORT = 3000;
 
-  for (let i = 0; i < numCPUs; i++) {
-    cluster.fork();
+// Middleware to handle CORS
+app.use((c, next) => {
+  c.res.headers.set("Access-Control-Allow-Origin", "*");
+  c.res.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  c.res.headers.set("Access-Control-Allow-Headers", "Content-Type");
+  if (c.req.method === "OPTIONS") {
+    return c.text("", 204);
+  }
+  return next();
+});
+
+const uploadDir = "temp_chunks";
+const uploadsDir = "uploads";
+
+const MAX_WORKERS = cpus().length;
+const workerPool = [];
+
+// Increase the maximum number of listeners
+EventEmitter.defaultMaxListeners = 100;
+
+// Initialize worker pool
+for (let i = 0; i < MAX_WORKERS; i++) {
+  const worker = new Worker(
+    `
+    import { parentPort } from 'worker_threads';
+    import { writeFile } from 'fs/promises';
+    import path from 'path';
+
+    parentPort.on('message', async ({ chunk, chunkPath }) => {
+      try {
+        await writeFile(chunkPath, chunk);
+        parentPort.postMessage({ success: true, chunkPath });
+      } catch (error) {
+        parentPort.postMessage({ success: false, error: error.message });
+      }
+    });
+  `,
+    { eval: true }
+  );
+
+  workerPool.push(worker);
+}
+
+let currentWorker = 0;
+
+function getNextWorker() {
+  const worker = workerPool[currentWorker];
+  currentWorker = (currentWorker + 1) % MAX_WORKERS;
+  return worker;
+}
+
+// Create necessary directories if they don't exist
+try {
+  await mkdir(uploadDir, { recursive: true });
+  await mkdir(uploadsDir, { recursive: true });
+} catch (error) {
+  if (error.code !== "EEXIST") {
+    console.error("Error creating directories:", error);
+  }
+}
+
+app.use("/*", serveStatic({ root: "./public" }));
+app.use("/uploads/*", serveStatic({ root: "./uploads" }));
+
+let db = new Database("chunks.db");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS chunks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fileId TEXT,
+      originalname TEXT,
+      chunkIndex INTEGER,
+      totalChunks INTEGER,
+      filename TEXT,
+      metadata TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS files (
+      id TEXT PRIMARY KEY,
+      originalname TEXT,
+      fileSize INTEGER,
+      fileType TEXT,
+      uploadedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+const wss = new WebSocketServer({ port: 3001 });
+
+wss.on("connection", (ws) => {
+  console.log("WebSocket connection established");
+});
+
+app.post("/upload", async (c) => {
+  const formData = await c.req.parseBody();
+  const file = formData.chunk;
+
+  if (!file) {
+    return c.json({ message: "No file uploaded" }, 400);
   }
 
-  cluster.on("exit", (worker, code, signal) => {
-    console.log(`worker ${worker.process.pid} died`);
-    cluster.fork();
-  });
-} else {
-  const app = express();
-  const upload = multer({ dest: "temp_chunks/" });
-  app.use(express.static("./public"));
-  app.use(cors());
-  app.use(express.json());
-  app.use(express.static("uploads"));
-  app.use(express.static("public"));
+  const fileId = uuidv4();
+  const { fileName, chunkIndex, totalChunks } = formData;
+  const fileDir = path.join(uploadDir, fileId);
+  const filename = `${chunkIndex}-${file.name}`;
+  const chunkPath = path.join(fileDir, filename);
 
-  let db;
+  try {
+    // Create directory for the file if it doesn't exist
+    await mkdir(fileDir, { recursive: true });
 
-  (async () => {
-    db = await open({
-      filename: "chunks.db",
-      driver: sqlite3.Database,
+    // Use a worker to write the chunk
+    const worker = getNextWorker();
+    const chunk = new Uint8Array(await file.arrayBuffer());
+
+    await new Promise((resolve, reject) => {
+      worker.postMessage({ chunk, chunkPath });
+
+      worker.once("message", (result) => {
+        if (result.success) {
+          resolve();
+        } else {
+          reject(new Error(result.error));
+        }
+      });
     });
 
-    await db.exec(`
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fileId TEXT,
-                originalname TEXT,
-                chunkIndex INTEGER,
-                totalChunks INTEGER,
-                filename TEXT,
-                metadata TEXT
-            );
+    // Insert chunk info into database
+    db.prepare(
+      `
+      INSERT INTO chunks (fileId, originalname, chunkIndex, totalChunks, filename)
+      VALUES (?, ?, ?, ?, ?)
+    `
+    ).run(fileId, fileName, chunkIndex, totalChunks, filename);
 
-            CREATE TABLE IF NOT EXISTS files (
-                id TEXT PRIMARY KEY,
-                originalname TEXT,
-                fileSize INTEGER,
-                fileType TEXT,
-                uploadedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-  })();
+    const count = db
+      .prepare(
+        `
+      SELECT COUNT(*) as count FROM chunks WHERE fileId = ? AND totalChunks = ?
+    `
+      )
+      .get(fileId, totalChunks);
 
-  app.post("/upload", upload.single("chunk"), async (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded" });
+    if (parseInt(count.count) === parseInt(totalChunks)) {
+      // Defer combination to a background process
+      setImmediate(async () => {
+        try {
+          const outputPath = path.join(
+            process.cwd(),
+            "uploads",
+            `${fileId}_${fileName}`
+          );
+
+          await combineChunks(fileId, outputPath);
+
+          const fileStats = await stat(outputPath);
+          db.prepare(
+            `
+          INSERT INTO files (id, originalname, fileSize, fileType)
+          VALUES (?, ?, ?, ?)
+        `
+          ).run(fileId, fileName, fileStats.size, file.type);
+
+          await deleteChunks(fileId);
+
+          console.log(`File ${fileName} combined and saved successfully`);
+        } catch (error) {
+          console.error("Error combining chunks:", error);
+          // Clean up any partial uploads
+          await deleteChunks(fileId);
+        }
+      });
+
+      return c.json({
+        message: "All chunks uploaded, combining in background",
+      });
+    } else {
+      // Send progress update via WebSocket
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(
+            JSON.stringify({
+              type: "progress",
+              fileId: fileId,
+              progress: (parseInt(count.count) / totalChunks) * 100,
+            })
+          );
+        }
+      });
+
+      return c.json({ message: "Chunk received" });
     }
+  } catch (error) {
+    console.error("Error processing chunk:", error);
+    return c.json({ message: "Error processing chunk" }, 500);
+  }
+});
 
-    const { fileId, fileName, chunkIndex, totalChunks } = req.body;
-    const { originalname, filename } = req.file;
+async function combineChunks(fileId, outputPath) {
+  const fileDir = path.join(uploadDir, fileId);
+  const chunks = db
+    .prepare(`SELECT filename FROM chunks WHERE fileId = ? ORDER BY chunkIndex`)
+    .all(fileId);
 
-    try {
-      await db.run(
-        `INSERT INTO chunks (fileId, originalname, chunkIndex, totalChunks, filename)
-                 VALUES (?, ?, ?, ?, ?)`,
-        [fileId, fileName, chunkIndex, totalChunks, filename]
-      );
+  const writeStream = createWriteStream(outputPath);
 
-      const [{ count }] = await db.all(
-        `SELECT COUNT(*) as count FROM chunks WHERE fileId = ? AND totalChunks = ?`,
-        [fileId, totalChunks]
-      );
-
-      if (parseInt(count) === parseInt(totalChunks)) {
-        const outputPath = path.join(
-          __dirname,
-          "uploads",
-          `${fileId}_${fileName}`
-        );
-
-        await combineChunks(fileId, outputPath);
-
-        const fileStats = await fsPromises.stat(outputPath);
-        await db.run(
-          `INSERT INTO files (id, originalname, fileSize, fileType) VALUES (?, ?, ?, ?)`,
-          [fileId, fileName, fileStats.size, req.file.mimetype]
-        );
-
-        await deleteChunks(fileId);
-
-        res.json({
-          message: "File uploaded, combined, and metadata saved successfully",
-          fileId: fileId,
-        });
-      } else {
-        res.json({ message: "Chunk received" });
-      }
-    } catch (error) {
-      console.error("Error processing chunk:", error);
-      res.status(500).json({ message: "Error processing chunk" });
-    }
-  });
-
-  async function combineChunks(fileId, outputPath) {
-    const writeStream = fs.createWriteStream(outputPath);
-
-    const chunks = await db.all(
-      `SELECT filename FROM chunks WHERE fileId = ? ORDER BY chunkIndex`,
-      [fileId]
-    );
-
+  try {
     for (const chunk of chunks) {
-      const chunkPath = path.join(__dirname, "temp_chunks", chunk.filename);
+      const chunkPath = path.join(fileDir, chunk.filename);
+
+      // Check if chunk exists before trying to read it
+      try {
+        await stat(chunkPath);
+      } catch (error) {
+        if (error.code === "ENOENT") {
+          throw new Error(`Chunk file not found: ${chunkPath}`);
+        }
+        throw error;
+      }
+
       await new Promise((resolve, reject) => {
-        const readStream = fs.createReadStream(chunkPath);
-        readStream.on("error", reject);
+        const readStream = createReadStream(chunkPath);
+
+        readStream.on("error", (error) => {
+          readStream.destroy();
+          writeStream.destroy();
+          reject(error);
+        });
+
+        writeStream.on("error", (error) => {
+          readStream.destroy();
+          writeStream.destroy();
+          reject(error);
+        });
+
         readStream.pipe(writeStream, { end: false });
         readStream.on("end", resolve);
       });
     }
 
-    return new Promise((resolve, reject) => {
+    // Close the write stream properly
+    await new Promise((resolve, reject) => {
+      writeStream.end();
       writeStream.on("finish", () => {
         console.log("File combination complete");
         resolve();
       });
       writeStream.on("error", reject);
-      writeStream.end();
     });
+  } catch (error) {
+    // Clean up in case of error
+    writeStream.destroy();
+    throw error;
   }
+}
 
-  async function deleteChunks(fileId) {
-    const chunks = await db.all(
-      `SELECT filename FROM chunks WHERE fileId = ?`,
-      [fileId]
-    );
+async function deleteChunks(fileId) {
+  const fileDir = path.join(uploadDir, fileId);
+  const chunks = db
+    .prepare(
+      `
+    SELECT filename FROM chunks WHERE fileId = ?
+  `
+    )
+    .all(fileId);
 
-    for (const chunk of chunks) {
-      const chunkPath = path.join(__dirname, "temp_chunks", chunk.filename);
-      try {
-        await fsPromises.unlink(chunkPath);
-      } catch (error) {
-        if (error.code !== "ENOENT") {
-          console.error(`Error deleting chunk file ${chunkPath}:`, error);
-        }
+  for (const chunk of chunks) {
+    const chunkPath = path.join(fileDir, chunk.filename);
+    try {
+      await unlink(chunkPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        console.error(`Error deleting chunk file ${chunkPath}:`, error);
       }
     }
-
-    await db.run(`DELETE FROM chunks WHERE fileId = ?`, [fileId]);
   }
 
-  app.get("/files", async (req, res) => {
-    try {
-      const files = await db.all(
-        "SELECT * FROM files ORDER BY uploadedAt DESC"
-      );
-      res.json(files);
-    } catch (error) {
-      console.error("Error fetching files:", error);
-      res.status(500).json({ message: "Error fetching files" });
+  // Remove the directory after deleting all chunks
+  try {
+    await rmdir(fileDir);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.error(`Error deleting directory ${fileDir}:`, error);
     }
-  });
+  }
 
-  app.get("/", (req, res) => {
-    res.sendFile(path.join(__dirname, "public", "index.html"));
-  });
-
-  const PORT = 3000;
-  app.listen(PORT, () => {
-    console.log(`Worker ${process.pid} is listening on port ${PORT}`);
-  });
+  db.prepare(`DELETE FROM chunks WHERE fileId = ?`).run(fileId);
 }
+
+app.get("/files", async (c) => {
+  try {
+    const files = db
+      .prepare("SELECT * FROM files ORDER BY uploadedAt DESC")
+      .all();
+    return c.json(files);
+  } catch (error) {
+    console.error("Error fetching files:", error);
+    return c.json({ message: "Error fetching files" }, 500);
+  }
+});
+
+app.get("/", (c) => {
+  return c.html(Bun.file("public/index.html"));
+});
+
+console.log(`Server starting on port ${PORT}`);
+
+export default {
+  port: PORT,
+  fetch: app.fetch,
+};
