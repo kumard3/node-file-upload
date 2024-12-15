@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Database } from "bun:sqlite";
-import { writeFile, unlink, stat, mkdir, rmdir } from "fs/promises";
+import { writeFile, unlink, stat, mkdir, rmdir,readdir } from "fs/promises";
 import { createReadStream, createWriteStream } from "fs";
 import * as path from "path";
 import { Worker } from "worker_threads";
@@ -300,12 +300,48 @@ async function deleteChunks(fileId) {
   db.prepare(`DELETE FROM chunks WHERE fileId = ?`).run(fileId);
 }
 
+// app.get("/files", async (c) => {
+//   try {
+//     const files = db
+//       .prepare("SELECT * FROM files ORDER BY uploadedAt DESC")
+//       .all();
+//       console.log(c.json(files),"files")
+//     return c.json(files);
+//   } catch (error) {
+//     console.error("Error fetching files:", error);
+//     return c.json({ message: "Error fetching files" }, 500);
+//   }
+// });
+
+
 app.get("/files", async (c) => {
   try {
-    const files = db
-      .prepare("SELECT * FROM files ORDER BY uploadedAt DESC")
-      .all();
-    return c.json(files);
+    // Check if uploads directory exists
+    const dirExists = await stat(uploadsDir).catch(() => false);
+    if (!dirExists) {
+      return c.json({ message: "Uploads directory does not exist" }, 404);
+    }
+
+    const files = await readdir(uploadsDir);
+    console.log("Files in uploads directory:", files); // Log the files
+
+    const fileDetails = await Promise.all(
+      files.map(async (file) => {
+        const filePath = path.join(uploadsDir, file);
+        const fileStats = await stat(filePath);
+        console.log(fileStats,"fileStats")
+        console.log(file,"file")
+        return {
+          originalname: file,
+          fileSize: fileStats.size,
+          createdAt: fileStats.birthtime,
+          fileType:"",
+          id: uuidv4()
+        };
+      })
+    );
+
+    return c.json(fileDetails);
   } catch (error) {
     console.error("Error fetching files:", error);
     return c.json({ message: "Error fetching files" }, 500);
