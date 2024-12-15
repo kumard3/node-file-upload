@@ -1,14 +1,14 @@
 import { Hono } from "hono";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Database } from "bun:sqlite";
-import { writeFile, unlink, stat, mkdir, rmdir,readdir } from "fs/promises";
+import { writeFile, unlink, stat, mkdir, rmdir, readdir } from "fs/promises";
 import { createReadStream, createWriteStream } from "fs";
 import * as path from "path";
 import { Worker } from "worker_threads";
 import { cpus } from "os";
 import { EventEmitter } from "events";
 import { WebSocketServer } from "ws";
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 
 const app = new Hono();
 const PORT = 3000;
@@ -75,7 +75,9 @@ try {
 }
 
 app.use("/*", serveStatic({ root: "./public" }));
-app.use("/uploads/*", serveStatic({ root: "./uploads" }));
+
+// Serve static files from the uploads directory at the root path
+app.use(serveStatic({ root: uploadsDir }));
 
 let db = new Database("chunks.db");
 db.exec(`
@@ -313,7 +315,6 @@ async function deleteChunks(fileId) {
 //   }
 // });
 
-
 app.get("/files", async (c) => {
   try {
     // Check if uploads directory exists
@@ -329,14 +330,12 @@ app.get("/files", async (c) => {
       files.map(async (file) => {
         const filePath = path.join(uploadsDir, file);
         const fileStats = await stat(filePath);
-        console.log(fileStats,"fileStats")
-        console.log(file,"file")
         return {
           originalname: file,
           fileSize: fileStats.size,
           createdAt: fileStats.birthtime,
-          fileType:"",
-          id: uuidv4()
+          fileType: "",
+          id: uuidv4(),
         };
       })
     );
